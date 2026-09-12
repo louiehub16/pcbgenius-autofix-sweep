@@ -1,0 +1,38 @@
+name: autofix-sweep
+on:
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run CPU auto-fix efficacy sweep (no GPU)
+        run: python sweep_autofix.py
+
+      - name: Upload result to R2
+        env:
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          BUCKET_NAME: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+        run: |
+          pip install --quiet boto3
+          python - <<'PY'
+          import os, boto3
+          from botocore.client import Config
+          s3=boto3.client("s3", endpoint_url=os.environ["R2_ENDPOINT_URL"],
+              aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+              config=Config(signature_version="s3v4", connect_timeout=10, read_timeout=20),
+              region_name="auto")
+          body=open("artifacts/autofix_sweep.json","rb").read()
+          s3.put_object(Bucket=os.environ["BUCKET_NAME"], Key="physics/autofix_sweep.json",
+                        Body=body, ContentType="application/json")
+          print("uploaded physics/autofix_sweep.json", len(body), "bytes")
+          PY
