@@ -715,6 +715,63 @@ def repair_pid_tolerance(nl: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[
 
 
 # ---------------------------------------------------------------------------
+# PHASE-1 specialist-surface gates (shared by public auto_fix() and
+# auto_fix_phase1()): which deterministic gates still FAIL, and the repairs
+# that clear them. Wired into the PUBLIC auto_fix() flow so production repair
+# (capture.py / regenerate.py, which call auto_fix()) actually applies the
+# LED/NTC/Buck-02/sensor20/MCU/precision/MPPT repairs rather than only the
+# slice-phase ones. Mirror of auto_fix_phase1()'s check set; never raises.
+# ---------------------------------------------------------------------------
+def _phase1_failing(nl: Dict[str, Any], dp: Optional[Dict[str, Any]]) -> List[str]:
+    """Names of PHASE-1 deterministic gates still FAIL on `nl` (empty = clean)."""
+    try:
+        from model.verification import verify_harness as _vh  # noqa: F401
+        from model.verification.v2 import sensor20ma as _s20
+        from model.verification.v2 import mcu as _mcu
+        from model.verification.v2 import precision as _prec
+        from model.verification.v2 import mppt as _mppt
+        fail: List[str] = []
+        checks = [
+            ("led.current_limit", _vh.check_led_current_limit(nl, design_params=dp)),
+            ("led.low_side", _vh.check_led_low_side(nl)),
+            ("ntc.pullup", _vh.check_ntc_pullup(nl, design_params=dp)),
+            ("buck02.tolerance", _vh.check_buck02_tolerance(nl, design_params=dp)),
+            ("usbc.cc_pd", _vh.check_usbc_cc_pd(nl)),
+            ("mcu.strapping", _mcu.check_mcu_strapping(nl)),
+            ("precision.check", _prec.check_precision(nl, design_params=dp)),
+        ]
+        for gname, res in checks:
+            if str(res.get("verdict")) == "FAIL":
+                fail.append(gname)
+        s20 = _s20.check_sensor20(nl, design_params=dp)
+        if s20.get("verdict") == "FAIL" and _s20._find_amp(nl)[0] is not None:
+            fail.append("sensor20.check")
+        if str(_mppt.check_mppt(nl, design_params=dp).get("verdict")) == "FAIL":
+            fail.append("mppt.check")
+        return fail
+    except Exception:  # pragma: no cover - never block the repair path
+        return []
+
+
+def _run_phase1_repairs(nl: Dict[str, Any], dp: Optional[Dict[str, Any]],
+                        fixes: List[Dict[str, Any]]) -> None:
+    """Apply the PHASE-1 specialist-surface repairs in place (guarded)."""
+    for fn, args in (
+        (_repair_led_current_limit, (nl, fixes, dp)),
+        (_repair_ntc_pullup_tolerance, (nl, fixes)),
+        (_repair_buck02_tolerance, (nl, fixes)),
+        (_repair_sensor20_emifilter, (nl, fixes, dp)),
+        (_repair_mcu_strapping, (nl, fixes)),
+        (_repair_precision, (nl, fixes, dp)),
+        (_repair_mppt_footprint, (nl, fixes, dp)),
+    ):
+        try:
+            fn(*args)
+        except Exception:  # pragma: no cover - one repair never breaks the rest
+            continue
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -772,8 +829,29 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
         # silently fixed. Probe the slice gates BEFORE returning early.
         _dp = (nl.get("metadata") or {}).get("design_params") if isinstance(nl.get("metadata"), dict) else None
         slice_needs_repair = bool(_failing_slice_gates(nl, _dp))
+        # A netlist authoritatively an op-amp or a 3-branch PID design is judged
+        # by its OWN oracle (see pid_is_oracle / op-amp resolution below); phase-1
+        # specialist-surface repairs must NOT run on it (e.g. the 4/20mA sensor20
+        # gate can false-positive on an op-amp input amp). Detect once, reuse at
+        # the final phase-1 revalidation.
+        _is_oa_pid = False
+        if _opa is not None:
+            try:
+                _is_oa_pid = bool(_opa._opamp_channels(nl))
+            except Exception:  # pragma: no cover
+                _is_oa_pid = False
+        if _pid_mod is not None and not _is_oa_pid:
+            try:
+                _is_oa_pid = bool(_pid_mod.find_error_amp_and_summing(nl)[0])
+            except Exception:  # pragma: no cover
+                _is_oa_pid = _is_oa_pid
+        # PHASE-1 specialist-surface gates (LED/NTC/Buck-02/sensor20/MCU/
+        # precision/MPPT) are part of the PUBLIC flow (previously only reachable
+        # via auto_fix_phase1). Probe before the early base-pass return so a
+        # netlist failing only a phase-1 gate is repaired, not silently 'fixed'.
+        phase1_needs_repair = bool(_phase1_failing(nl, _dp)) and not _is_oa_pid
 
-        if base_pass and not opamp_needs_repair and not pid_needs_repair and not slice_needs_repair:
+        if base_pass and not opamp_needs_repair and not pid_needs_repair and not slice_needs_repair and not phase1_needs_repair:
             return {"fixed": True, "fixes": [], "netlist": nl}
 
         # Repair conservatively: only fix rules that actually failed, and only
@@ -877,6 +955,11 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:  # pragma: no cover - never break the repair flow
             pass
 
+        # Apply the PHASE-1 specialist-surface repairs (deterministic, guarded) so
+        # the PUBLIC entry clears LED/NTC/Buck-02/sensor20/MCU/precision/MPPT too.
+        if phase1_needs_repair:
+            _run_phase1_repairs(nl, _dp, fixes)
+
         # Re-validate the 7 slice gates on the FINAL netlist (R1 contract held
         # end-to-end). The recommendation-only gates (bom.match / esd.order /
         # pwr.reverse_diode) are never fabricated a repair — if one is still
@@ -887,6 +970,16 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
             fixes.append({"gate": gname, "param": "slice_unfixed",
                           "old": None, "new": why or ""})
         if _slice_unfixed:
+            fixed = False
+
+        # Re-validate the PHASE-1 gates on the FINAL netlist (same fail-closed
+        # rule as the slice gates): any still-unrepaired phase-1 FAIL forces
+        # fixed=False and is recorded for the caller / specialist.
+        _ph1_unfixed = _phase1_failing(nl, _dp) if not _is_oa_pid else []
+        for gname in _ph1_unfixed:
+            fixes.append({"gate": gname, "param": "phase1_unfixed",
+                          "old": None, "new": ""})
+        if _ph1_unfixed:
             fixed = False
 
         return {"fixed": fixed, "fixes": fixes, "netlist": nl}

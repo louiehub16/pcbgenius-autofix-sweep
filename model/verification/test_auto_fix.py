@@ -537,5 +537,39 @@ class R3GateReverifyAfterRepairTest(unittest.TestCase):
         self._assert_gate_reverified(nl, _vh.check_pwr_bleed, "pwr.bleed", "value")
 
 
+class PublicAutoFixRegressionTest(unittest.TestCase):
+    """Regression: the PUBLIC auto_fix() entry must apply the PHASE-1 specialist-
+    surface repairs (now wired into the production path), so a netlist failing only
+    a phase-1 gate is fixed via auto_fix() — not only via the explicit
+    auto_fix_phase1() helper (which capture.py / regenerate.py never called)."""
+
+    def test_public_auto_fix_repairs_ntc_coarse_tolerance(self):
+        nl = _ntc_netlist("5%")
+        self.assertEqual(_vh.check_ntc_pullup(nl, design_params=DP)["verdict"], "FAIL")
+        out = _af.auto_fix(nl)                    # PRODUCTION entry
+        # The phase-1 repair fired THROUGH the public entry and cleared the gate.
+        self.assertTrue(out.get("fixes"), "public auto_fix must apply a phase-1 repair")
+        self.assertEqual(_vh.check_ntc_pullup(out["netlist"], design_params=DP)["verdict"], "PASS")
+
+    def test_public_auto_fix_repairs_led_missing_series_r(self):
+        nl = _good_led_netlist()
+        nl["components"] = [c for c in nl["components"] if c["ref"] != "R_LED"]
+        led = _find_value(nl, "LED1")
+        for p_ in led["pins"]:
+            if p_["name"] == "A":
+                p_["net"] = "VIN"
+        self.assertEqual(_vh.check_led_current_limit(nl, design_params=DP)["verdict"], "FAIL")
+        out = _af.auto_fix(nl)                    # PRODUCTION entry
+        self.assertTrue(out.get("fixes"), "public auto_fix must apply a phase-1 repair")
+        self.assertEqual(_vh.check_led_current_limit(out["netlist"], design_params=DP)["verdict"], "PASS")
+
+    def test_public_auto_fix_repairs_buck02_coarse_divider(self):
+        nl = _buck_netlist("5%")
+        self.assertEqual(_vh.check_buck02_tolerance(nl, design_params=DP)["verdict"], "FAIL")
+        out = _af.auto_fix(nl)                    # PRODUCTION entry
+        self.assertTrue(out.get("fixes"), "public auto_fix must apply a phase-1 repair")
+        self.assertEqual(_vh.check_buck02_tolerance(out["netlist"], design_params=DP)["verdict"], "PASS")
+
+
 if __name__ == "__main__":
     unittest.main()
