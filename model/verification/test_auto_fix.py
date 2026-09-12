@@ -179,33 +179,44 @@ def _mppt_netlist():
 
 
 class MpptRepairTest(unittest.TestCase):
-    def test_mppt_power_fail_repairs_footprint_to_1206(self):
+    def test_mppt_power_fail_repairs_to_clearable_footprint(self):
+        # A shunt that a BIGGER KNOWN-RATED footprint can clear: imax=6A x 0.01 ohm
+        # => P_calc=0.36W needs P_rated>=0.72W -> only 2512 (1.0W) suffices. The
+        # ladder must WALK PAST the unknown-rating sizes (1210/2010) to land 2512
+        # and confirm PASS (not stop on the first INDETERMINATE).
         nl = _mppt_netlist()
-        dp = {"imax": 10}
-        # gate must flag it first
+        dp = {"imax": 6}
         from model.verification.v2 import mppt as _mppt
         self.assertEqual(_mppt.check_shunt_power(nl, design_params=dp)["verdict"], "FAIL")
         out = _af.auto_fix_phase1(nl, design_params=dp)
-        # The repair MUST upsize the shunt footprint + clear the power FAIL.
-        # (It now iterates up the size ladder until the under-rated FAIL clears;
-        #  a small 0805 shunt at 10A lands at 1210+. `fixed` may stay False
-        #  because MPPT gate is INDETERMINATE on Kelvin layout — the meaningful
-        #  assertion is the repair landed AND power no longer FAILs.)
         shunt = _find_value(out["netlist"], "RS")
         size = str(shunt["package"]).lower()
-        # landed on a larger footprint (>= 1206)
-        self.assertNotEqual(_mppt._find_size_token(size), "0805",
-                            "shunt package must be upsized from 0805")
-        self.assertIn(size, ("1206", "1210", "2010", "2512"),
-                      f"shunt landed on an up-sized package, got {size}")
+        self.assertEqual(_mppt._find_size_token(size), "2512",
+                         "must walk past unknown-rating 1210/2010 to the known 2512, got %s" % size)
+        res = _mppt.check_shunt_power(out["netlist"], design_params=dp)
+        self.assertEqual(res["verdict"], "PASS",
+                         "2512 (1.0W) must clear P_calc=0.36W; got %s: %s" % (res.get("verdict"), res.get("detail")))
+
+    def test_mppt_power_fail_honestly_rolls_back_when_unfixable(self):
+        # imax=10A x 0.01 ohm => P_calc=1W needs P_rated>=2W, but the ratings table
+        # caps at 2512=1.0W -> GENUINELY unfixable by any footprint. Minimal-repair
+        # (dual-review): the ladder walks to 2512, finds no CONFIRMED PASS, so the
+        # repair ROLLS BACK to the original package and records NO fix (no over-fix,
+        # no fabricated clear). The power check honestly stays FAIL.
+        nl = _mppt_netlist()
+        dp = {"imax": 10}
+        from model.verification.v2 import mppt as _mppt
+        out = _af.auto_fix_phase1(nl, design_params=dp)
+        shunt = _find_value(out["netlist"], "RS")
+        size = str(shunt["package"]).lower()
+        self.assertEqual(_mppt._find_size_token(size), "0805",
+                         "must ROLL BACK to original 0805 when no footprint confirms a clear, got %s" % size)
         pkg_fixes = [f for f in out["fixes"] if f.get("param") == "package"]
-        self.assertTrue(pkg_fixes, f"must record package repairs; fixes={out['fixes']}")
-        # and the power check no longer FAILs after upsizing
-        self.assertNotEqual(
-            _mppt.check_shunt_power(out["netlist"], design_params=dp)["verdict"],
-            "FAIL",
-            "after upsize the shunt power check must not fail",
-        )
+        self.assertFalse(pkg_fixes,
+                         "no package fix may be recorded when the repair cannot confirm a clear")
+        self.assertEqual(_mppt.check_shunt_power(out["netlist"], design_params=dp)["verdict"],
+                         "FAIL",
+                         "a 1W shunt at 10A is genuinely unfixable -> power must honestly still FAIL (not fabricated)")
 
 
 def _mk(components, nets):
@@ -593,16 +604,14 @@ class PublicAutoFixRegressionTest(unittest.TestCase):
                         "auto_fix must add a 5.1k CC pull-down")
         self.assertEqual(_vh.check_usbc_cc_pd(out["netlist"])["verdict"], "PASS")
 
-    def test_pid_check_determinizes_to_pass_when_no_error_amp(self):
-        # pid.check must DETERMINISTICALLY PASS when no PID error-amp is present,
-        # not sit INDETERMINATE (which inflated the specialist queue for the
-        # common non-PID netlist). Matches the harness auto-PASS-on-absent-class
-        # convention (led.current_limit -> "no LED present").
+    def test_pid_check_stays_indeterminate_when_no_error_amp(self):
+        # Dual-review correction: a missing PID error-amp is NOT auto-PASS; it
+        # stays INDETERMINATE (specialist) because a malformed intended PID must
+        # not be reported as a verified electrical PASS.
         from model.verification.v2 import pid as _pidm
         nl = _good_led_netlist()
         res = _pidm.check_pid(nl)
-        self.assertEqual(res.get("verdict"), "PASS")
-        self.assertFalse(res.get("repairable"))
+        self.assertEqual(res.get("verdict"), "INDETERMINATE")
 
 
 if __name__ == "__main__":

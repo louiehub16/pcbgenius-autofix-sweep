@@ -722,39 +722,54 @@ def repair_pid_tolerance(nl: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[
 # LED/NTC/Buck-02/sensor20/MCU/precision/MPPT repairs rather than only the
 # slice-phase ones. Mirror of auto_fix_phase1()'s check set; never raises.
 # ---------------------------------------------------------------------------
-def _phase1_failing(nl: Dict[str, Any], dp: Optional[Dict[str, Any]]) -> List[str]:
-    """Names of PHASE-1 deterministic gates still FAIL on `nl` (empty = clean)."""
-    try:
-        from model.verification import verify_harness as _vh  # noqa: F401
+def _phase1_failing(nl: Dict[str, Any], dp: Optional[Dict[str, Any]],
+                    suppress_sensor20: bool = False) -> List[str]:
+    """Return PHASE-1 deterministic gates that are NOT confirmed-PASS on `nl`.
+
+    A gate is included when its check returns FAIL **or ERRORS** (unresolved). This
+    is FAIL-CLOSED: an exception is never swallowed to an empty list, and a broken
+    checker forces the gate onto the repair/revalidation path (so `fixed` can't be
+    True). `suppress_sensor20` skips ONLY the sensor20 gate, which is known to
+    false-positive on op-amp/PID topologies; every other gate is always checked
+    (per dual-review: never blanket-suppress the whole phase-1 set).
+    """
+    fail: List[str] = []
+
+    def _check(name, fn):
+        try:
+            res = fn()
+            v = str(res.get("verdict")) if isinstance(res, dict) else "ERR"
+            if v == "FAIL" or v == "ERR":
+                fail.append(name)  # ERR = unresolved => blocks fixed=True
+        except Exception:
+            fail.append(name)  # fail-closed: an exception is never 'clean'
+
+    from model.verification import verify_harness as _vh  # noqa: F401
+    from model.verification.v2 import mcu as _mcu
+    from model.verification.v2 import precision as _prec
+    from model.verification.v2 import mppt as _mppt
+    _check("led.current_limit", lambda: _vh.check_led_current_limit(nl, design_params=dp))
+    _check("led.low_side", lambda: _vh.check_led_low_side(nl))
+    _check("ntc.pullup", lambda: _vh.check_ntc_pullup(nl, design_params=dp))
+    _check("buck02.tolerance", lambda: _vh.check_buck02_tolerance(nl, design_params=dp))
+    _check("usbc.cc_pd", lambda: _vh.check_usbc_cc_pd(nl))
+    _check("mcu.strapping", lambda: _mcu.check_mcu_strapping(nl))
+    _check("precision.check", lambda: _prec.check_precision(nl, design_params=dp))
+    if not suppress_sensor20:
         from model.verification.v2 import sensor20ma as _s20
-        from model.verification.v2 import mcu as _mcu
-        from model.verification.v2 import precision as _prec
-        from model.verification.v2 import mppt as _mppt
-        fail: List[str] = []
-        checks = [
-            ("led.current_limit", _vh.check_led_current_limit(nl, design_params=dp)),
-            ("led.low_side", _vh.check_led_low_side(nl)),
-            ("ntc.pullup", _vh.check_ntc_pullup(nl, design_params=dp)),
-            ("buck02.tolerance", _vh.check_buck02_tolerance(nl, design_params=dp)),
-            ("usbc.cc_pd", _vh.check_usbc_cc_pd(nl)),
-            ("mcu.strapping", _mcu.check_mcu_strapping(nl)),
-            ("precision.check", _prec.check_precision(nl, design_params=dp)),
-        ]
-        for gname, res in checks:
-            if str(res.get("verdict")) == "FAIL":
-                fail.append(gname)
-        s20 = _s20.check_sensor20(nl, design_params=dp)
-        if s20.get("verdict") == "FAIL" and _s20._find_amp(nl)[0] is not None:
+        try:
+            s20 = _s20.check_sensor20(nl, design_params=dp)
+            if str(s20.get("verdict")) == "FAIL" and _s20._find_amp(nl)[0] is not None:
+                fail.append("sensor20.check")
+        except Exception:
             fail.append("sensor20.check")
-        if str(_mppt.check_mppt(nl, design_params=dp).get("verdict")) == "FAIL":
-            fail.append("mppt.check")
-        return fail
-    except Exception:  # pragma: no cover - never block the repair path
-        return []
+    _check("mppt.check", lambda: _mppt.check_mppt(nl, design_params=dp))
+    return fail
 
 
 def _run_phase1_repairs(nl: Dict[str, Any], dp: Optional[Dict[str, Any]],
-                        fixes: List[Dict[str, Any]]) -> None:
+                        fixes: List[Dict[str, Any]],
+                        skip_sensor20: bool = False) -> None:
     """Apply the PHASE-1 specialist-surface repairs in place (guarded)."""
     for fn, args in (
         (_repair_led_current_limit, (nl, fixes, dp)),
@@ -766,6 +781,8 @@ def _run_phase1_repairs(nl: Dict[str, Any], dp: Optional[Dict[str, Any]],
         (_repair_mppt_footprint, (nl, fixes, dp)),
         (_repair_usbc_cc_pd, (nl, fixes)),
     ):
+        if skip_sensor20 and fn.__name__ == "_repair_sensor20_emifilter":
+            continue  # op-amp/PID netlist: sensor20 amp-detection false-positives
         try:
             fn(*args)
         except Exception:  # pragma: no cover - one repair never breaks the rest
@@ -850,7 +867,7 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
         # precision/MPPT) are part of the PUBLIC flow (previously only reachable
         # via auto_fix_phase1). Probe before the early base-pass return so a
         # netlist failing only a phase-1 gate is repaired, not silently 'fixed'.
-        phase1_needs_repair = bool(_phase1_failing(nl, _dp)) and not _is_oa_pid
+        phase1_needs_repair = bool(_phase1_failing(nl, _dp, suppress_sensor20=_is_oa_pid))
 
         if base_pass and not opamp_needs_repair and not pid_needs_repair and not slice_needs_repair and not phase1_needs_repair:
             return {"fixed": True, "fixes": [], "netlist": nl}
@@ -959,7 +976,7 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Apply the PHASE-1 specialist-surface repairs (deterministic, guarded) so
         # the PUBLIC entry clears LED/NTC/Buck-02/sensor20/MCU/precision/MPPT too.
         if phase1_needs_repair:
-            _run_phase1_repairs(nl, _dp, fixes)
+            _run_phase1_repairs(nl, _dp, fixes, skip_sensor20=_is_oa_pid)
 
         # Re-validate the 7 slice gates on the FINAL netlist (R1 contract held
         # end-to-end). The recommendation-only gates (bom.match / esd.order /
@@ -974,12 +991,11 @@ def auto_fix(netlist_dict: Dict[str, Any]) -> Dict[str, Any]:
             fixed = False
 
         # Re-validate the PHASE-1 gates on the FINAL netlist (same fail-closed
-        # rule as the slice gates): any still-unrepaired phase-1 FAIL forces
-        # fixed=False and is recorded for the caller / specialist.
-        _ph1_unfixed = _phase1_failing(nl, _dp) if not _is_oa_pid else []
-        for gname in _ph1_unfixed:
-            fixes.append({"gate": gname, "param": "phase1_unfixed",
-                          "old": None, "new": ""})
+        # rule as the slice gates): any still-unrepaired / unresolved phase-1
+        # gate forces fixed=False. NOTE: these are NOT added to `fixes` (which
+        # must list only actually-applied changes) — a residual gate is reported
+        # purely via the fixed=False verdict + the caller's specialist route.
+        _ph1_unfixed = _phase1_failing(nl, _dp, suppress_sensor20=_is_oa_pid)
         if _ph1_unfixed:
             fixed = False
 
@@ -1959,7 +1975,15 @@ def _repair_mppt_footprint(nl: Dict[str, Any], fixes: List[Dict[str, Any]],
 
     def _still_fails() -> bool:
         res = _mppt.check_shunt_power(nl, design_params=design_params)
-        return isinstance(res, dict) and res.get("verdict") == "FAIL"
+        return isinstance(res, dict) and res.get("verdict") == _mppt._FAIL
+
+    def _confirmed_pass() -> bool:
+        # We only want a CONFIRMED clear. An INDETERMINATE here is the
+        # "footprint-size rating unknown" case (e.g. 1210/2010 absent from
+        # DEFAULT_RESISTOR_RATINGS) — keep walking the ladder to a KNOWN-rated
+        # size that genuinely clears, rather than stopping on an unknown.
+        res = _mppt.check_shunt_power(nl, design_params=design_params)
+        return isinstance(res, dict) and res.get("verdict") == _mppt._PASS
 
     if not _still_fails():
         return  # no conclusively under-rated shunt -> no blind upsize
@@ -1972,24 +1996,36 @@ def _repair_mppt_footprint(nl: Dict[str, Any], fixes: List[Dict[str, Any]],
             idx = _SIZE_LADDER.index(token.upper())
         except ValueError:
             continue
-        cur_pkg = pkg
+        orig_pkg = c.get("package")
+        orig_mpn = c.get("mpn")
+        committed = False
         while idx + 1 < len(_SIZE_LADDER):
             idx += 1
             next_token = _SIZE_LADDER[idx]
-            cur_pkg = str(c.get("package") or cur_pkg)
-            # advance the size token in the current package string
+            cur_pkg = str(c.get("package") or orig_pkg)
             cur_token = _mppt._find_size_token(cur_pkg) or token
             new_pkg = cur_pkg.replace(cur_token, next_token, 1) if cur_token in cur_pkg else cur_pkg
             c["package"] = new_pkg
-            fixes.append({"ref": c.get("ref"), "param": "package",
-                          "old": cur_pkg or None, "new": new_pkg})
-            if isinstance(c.get("mpn"), str) and c["mpn"] and token in c["mpn"]:
-                c["mpn"] = c["mpn"].replace(token, _SIZE_LADDER[idx], 1)
-                fixes.append({"ref": c.get("ref"), "param": "mpn",
-                              "old": None, "new": c["mpn"]})
-            cur_pkg = new_pkg
-            if not _still_fails():
-                break  # cleared the power check -> stop upsizing
+            if isinstance(orig_mpn, str) and orig_mpn and token in orig_mpn:
+                c["mpn"] = orig_mpn.replace(token, _SIZE_LADDER[idx], 1)
+            # Minimal repair (dual-review): commit the mutation + its fix records
+            # ONLY once a size is CONFIRMED to clear (a confirmed PASS). Walking
+            # past unknown-rating sizes (1210/2010) is allowed, but we must land
+            # on a known-rated size that genuinely clears.
+            if _confirmed_pass():
+                fixes.append({"ref": c.get("ref"), "param": "package",
+                              "old": orig_pkg or None, "new": new_pkg})
+                if c.get("mpn") != orig_mpn:
+                    fixes.append({"ref": c.get("ref"), "param": "mpn",
+                                  "old": orig_mpn, "new": c.get("mpn")})
+                committed = True
+                break
+        if not committed:
+            # No footprint confirms a clear -> roll back to the ORIGINAL size and
+            # part number (minimal-repair: never leave an over-sized netlist) and
+            # record no fix. The gate remains honestly FAIL/INDETERMINATE.
+            c["package"] = orig_pkg
+            c["mpn"] = orig_mpn
 
 
 # ---------------------------------------------------------------------------

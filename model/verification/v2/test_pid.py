@@ -97,14 +97,13 @@ class PidCheckTest(unittest.TestCase):
         self.assertEqual(res["verdict"], "INDETERMINATE")
         self.assertIn("unstated", res["detail"].lower())
 
-    def test_no_error_amp_determinizes_to_pass(self):
-        # No PID error-amp (summing) node = not a PID design -> the gate must
-        # DETERMINISTICALLY PASS (matching the harness auto-PASS-on-absent-class
-        # convention, e.g. led.current_limit -> "no LED present"), not sit
-        # INDETERMINATE and inflate the specialist queue for non-PID netlists.
+    def test_no_error_amp_indeterminate(self):
+        # Dual-review correction: a missing error-amp is NOT auto-PASS (it could
+        # be a malformed intended PID, not an inapplicable one) -> stays
+        # INDETERMINATE / specialist.
         res = pid.check_pid(build(with_amp=False))
-        self.assertEqual(res["verdict"], "PASS")
-        self.assertFalse(res.get("repairable"))
+        self.assertEqual(res["verdict"], "INDETERMINATE")
+        self.assertIn("summing", res["detail"].lower())
 
     def test_stability_always_indeterminate(self):
         for kwargs in ({"rd": False}, {}, {"rp_tol_set": False}, {"rp_tol": "5%"}):
