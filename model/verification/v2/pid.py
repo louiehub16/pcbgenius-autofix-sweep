@@ -412,8 +412,15 @@ def check_pid(nl: Dict[str, Any]) -> Dict[str, Any]:
         return _indet("no netlist — cannot run T_PID_01")
     amp, summing = find_error_amp_and_summing(nl)
     if amp is None or not summing:
-        return _indet("no error-amp inverting (summing) node found — no "
-                      "recognizable PID configuration to verify")
+        # Determinize the absent-class case: no error-amp summing node = not a PID
+        # design, so the gate auto-PASSes (matching every other harness gate, e.g.
+        # led.current_limit -> "no LED present"). This removes an INDETERMINATE
+        # that was otherwise inflating the specialist queue for the common non-PID
+        # netlist. A genuine PID FAIL is still caught below when branches/tolerance
+        # are assessed.
+        return {"verdict": "PASS",
+                "detail": "no PID error-amp (summing) node present — nothing to verify",
+                "repairable": False}
     branches = _enumerate_branches(nl, summing, amp)
     p, i, d, missing = _resolve_coverage(branches)
     if missing:

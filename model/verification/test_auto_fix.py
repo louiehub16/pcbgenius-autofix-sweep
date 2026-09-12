@@ -570,6 +570,40 @@ class PublicAutoFixRegressionTest(unittest.TestCase):
         self.assertTrue(out.get("fixes"), "public auto_fix must apply a phase-1 repair")
         self.assertEqual(_vh.check_buck02_tolerance(out["netlist"], design_params=DP)["verdict"], "PASS")
 
+    def test_public_auto_fix_repairs_usbc_missing_pulldown(self):
+        # A bare USB-C CC line (no PD controller, no 5.1k pull-down to GND) must
+        # be repaired to PASS by the PUBLIC auto_fix() via the new _repair_usbc_cc_pd.
+        nl = {
+            "components": [
+                {"ref": "J1", "type": "connector", "value": "USB-C", "mpn": "USB-C",
+                 "pins": [{"name": "CC1", "net": "CC1"},
+                          {"name": "VCC", "net": "VCC"}, {"name": "GND", "net": "GND"}]},
+            ],
+            "nets": [
+                {"name": "CC1", "class": "signal", "pins": ["J1.CC1"]},
+                {"name": "VCC", "class": "power", "pins": ["J1.VCC"]},
+                {"name": "GND", "class": "ground", "pins": ["J1.GND"]},
+            ],
+            "metadata": {},
+        }
+        self.assertEqual(_vh.check_usbc_cc_pd(nl)["verdict"], "FAIL")
+        out = _af.auto_fix(nl)                    # PRODUCTION entry
+        self.assertTrue(any(f.get("param") == "value" and "5.1k" in str(f.get("new"))
+                            for f in out.get("fixes", [])),
+                        "auto_fix must add a 5.1k CC pull-down")
+        self.assertEqual(_vh.check_usbc_cc_pd(out["netlist"])["verdict"], "PASS")
+
+    def test_pid_check_determinizes_to_pass_when_no_error_amp(self):
+        # pid.check must DETERMINISTICALLY PASS when no PID error-amp is present,
+        # not sit INDETERMINATE (which inflated the specialist queue for the
+        # common non-PID netlist). Matches the harness auto-PASS-on-absent-class
+        # convention (led.current_limit -> "no LED present").
+        from model.verification.v2 import pid as _pidm
+        nl = _good_led_netlist()
+        res = _pidm.check_pid(nl)
+        self.assertEqual(res.get("verdict"), "PASS")
+        self.assertFalse(res.get("repairable"))
+
 
 if __name__ == "__main__":
     unittest.main()

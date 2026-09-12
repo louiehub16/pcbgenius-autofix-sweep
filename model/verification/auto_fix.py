@@ -764,6 +764,7 @@ def _run_phase1_repairs(nl: Dict[str, Any], dp: Optional[Dict[str, Any]],
         (_repair_mcu_strapping, (nl, fixes)),
         (_repair_precision, (nl, fixes, dp)),
         (_repair_mppt_footprint, (nl, fixes, dp)),
+        (_repair_usbc_cc_pd, (nl, fixes)),
     ):
         try:
             fn(*args)
@@ -2083,6 +2084,42 @@ def _repair_switch_flyback(nl: Dict[str, Any], fixes: List[Dict[str, Any]]) -> N
     return verdict == "PASS"
 
 
+def _repair_usbc_cc_pd(nl: Dict[str, Any], fixes: List[Dict[str, Any]]) -> None:
+    """Cite the UsbC_01 gate: add a missing 5.1k (±20%) CC pull-down resistor from
+    every bare CC line to an exact-ground net.
+
+    Universal hard spec: each CC line must carry a 5.1k pull-down to GND unless a
+    USB-C PD controller owns the line (the controller provides it), mirroring
+    verify_harness._has_pulldown. Fail-closed: if no resolvable exact-ground net
+    exists we SKIP (honest unfixable) rather than invent a net. Never fabricates.
+    """
+    from model.verification import verify_harness as _vh  # lazy: avoid cycle
+    cc_nets = _vh._cc_nets(nl)
+    if not cc_nets:
+        cc_nets = {n.get("name"): None for n in _nets(nl)
+                   if str(n.get("name") or "").upper().startswith("CC")
+                   and not _is_ground_net(nl, n.get("name"))}
+    gnd = _find_ground_net(nl)
+    if gnd is None:
+        return  # no ground net -> cannot place a pull-down; leave fail-closed
+    for net in cc_nets:
+        if _vh._pd_controller_owns(nl, net):
+            continue  # PD controller provides the pull-down
+        if _vh._has_pulldown(nl, net):
+            continue  # already a 5.1k (±20%) to GND
+        rref = _next_ref(nl, "RCC")
+        _components(nl).append({
+            "ref": rref, "type": "resistor", "value": "5.1k", "package": "0805", "mpn": "",
+            "pins": [{"name": "1", "number": "1", "net": net},
+                     {"name": "2", "number": "2", "net": gnd}],
+            "properties": {"role": "cc_pulldown"},
+        })
+        _append_net_pin(nl, net, f"{rref}.1")
+        _append_net_pin(nl, gnd, f"{rref}.2")
+        fixes.append({"ref": rref, "param": "value", "old": None,
+                      "new": "5.1k (CC pull-down: %s->%s)" % (net, gnd)})
+
+
 def _repair_switch_gate_bleeder(nl: Dict[str, Any], fixes: List[Dict[str, Any]]) -> None:
     """Add a 10k bleeder resistor between each discrete transistor's control pin
     and its source (or ground) net, for every raw gate the gate_bleeder gate flags."""
@@ -2236,6 +2273,7 @@ def auto_fix_phase1(netlist_dict: Dict[str, Any],
         _repair_mcu_strapping(nl, fixes)
         _repair_precision(nl, fixes, design_params)
         _repair_mppt_footprint(nl, fixes, design_params)
+        _repair_usbc_cc_pd(nl, fixes)
         # 7-rule auto-fix slice repairs: mutational (netlist-level) guard by the
         # gate each satisfies. Re-verification of these is gate-by-gate in the
         # repair tests, mirroring the MPPT repair pattern.
